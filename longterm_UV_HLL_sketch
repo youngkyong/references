@@ -1,0 +1,89 @@
+# Longterm UV using HLL sketch in BigQuery
+
+SELECT count(DISTINCT userid) AS unique_users;
+
+위와 같은 Distinct Count 는 자주 쓰이면서도 성능이 잘 안 나오는 질의 유형입니다.
+이를 효과적으로 계산하기 위해  Linear Counting, HyperLogLog 등  cardinality estimation 방법들이 자주 사용됩니다.
+특히 HyperLogLog(이하 HLL) 방법은 적은 메모리를 사용하여 효과적으로 estimation 하여, 여러 솔루션들에서 많이 채택하고 있습니다. 
+
+BigQuery 에서는 HyperLogLog++ 알고리즘을 이용한 approx. cardinality function 을 제공하며
+또한 한번 계산된 HLL sketch 를 UNION 하는 function들도 제공한다.
+
+
+1. Daily HLL Sketch 저장
+
+-- Result Table : mydataset.mytable$20190904
+  
+SELECT '20190904' as dt
+ , device_os
+ , new_oaid_yn
+ , APPROX_COUNT_DISTINCT(oaid) as uv
+ , HLL_COUNT.INIT(oaid) as sketch
+FROM mydataset.srctable
+WHERE _partitiontime = timestamp('2019-09-04')
+AND device_os > ''
+AND new_oaid_yn IN ('Y','N','A')
+GROUP BY ROLLUP(device_os, new_oaid_yn)
+UNION ALL
+SELECT '20190904' as dt
+ , null as device_os
+ , new_oaid_yn
+ , APPROX_COUNT_DISTINCT(oaid) as uv
+ , HLL_COUNT.INIT(oaid) as sketch
+FROM cms_drill.mp_master_data
+WHERE _partitiontime = timestamp('2019-09-04')
+AND new_oaid_yn IN ('Y','N','A')
+GROUP BY new_oaid_yn
+ 
+
+2. Longterm UV 계산
+
+-- Total UV only
+--------------------------------------------------------------------
+ 
+SELECT
+       HLL_COUNT.MERGE(sketch) uv
+FROM cms_drill.mp_uv_sketch
+WHERE _partitiontime BETWEEN timestamp('${startdate}') AND timestamp('${enddate}')
+AND device_os IS NULL
+  
+  
+--------------------------------------------------------------------
+-- Unique users per device
+-- Lightweight unique user calculation using BigQuery HLL Sketch
+-- Param:
+--   startdate : yyyy-mm-dd (since 2017-12-01)
+--   enddate : yyyy-mm-dd
+-- Note:
+--   'ALL' in device_os means Total UU
+--------------------------------------------------------------------
+ 
+SELECT ifnull(device_os, 'ALL') AS device_os,
+       HLL_COUNT.MERGE(sketch) uv
+FROM cms_drill.mp_uv_sketch
+WHERE _partitiontime BETWEEN timestamp('${startdate}') AND timestamp('${enddate}')
+GROUP BY device_os
+ORDER BY uv DESC
+;
+
+
+참고: Hive 
+HLL 구현 라이브러리에는 MLnick, hive-hll, Hivemall 등 여러가지가 있으나, 일반적인 경우 Hivemall 사용을 권장
+단, Hivemall UDF 에는 아직 HLL sketch 비트맵 연산 방법이 없으므로, HLL Union 이 필요한 경우는 hive-hll 라이브러리를 사용 
+
+다른 DB 시스템에서의 HLL
+* BigQuery : 디폴트로 approx 로 동작. COUNT(DISTINCT field, n) 으로 정밀도 조정 가능. 정확한 수치를 원하는 경우 EXACT_COUNT_DISTINCT(field) 함수 별도 사용.  https://cloud.google.com/bigquery/docs/reference/legacy-sql 
+* Redshift :  (APPROXIMATE) COUNT 구문 제공. HLL 기반  http://docs.aws.amazon.com/redshift/latest/dg/r_COUNT.html
+* Redis : HLL 기반의 PFADD, PFCOUNT, PFMERGE 커맨드 제공  https://robots.thoughtbot.com/hyperloglogs-in-redis 
+* Elasticsearch : HLL 기반 https://www.elastic.co/blog/count-elasticsearch
+* mysql : HLL 기반의 hll string 저장 및 merge 기능 제공: https://github.com/amirtuval/mysql-hyperloglog
+
+
+Reference
+* Slide : HyperLogLog in Hive - How to count sheep efficiently?
+* Slide: HLL talk at SFPUG 
+* PROBABILISTIC DATA STRUCTURES FOR WEB ANALYTICS AND DATA MINING
+* HyperLogLog in Pure SQL
+* Github - WANdisco hive UDF ( Wiki )
+
+ 
