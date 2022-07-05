@@ -1,0 +1,224 @@
+# Hive metastore DB의 정보 활용
+
+일반적으로 production Hive 에서는 mysql 등 RDBMS 를 metastore DB 로 이용한다. 
+
+테이블, 파티션 정보 등을 metastore DB에서 추출할 수 있는 방법을 정리한다.
+
+1. metastore DB 정보 확인 : hive-site.xml
+  - javax.jdo.option.ConnectionURL 
+  - javax.jdo.option.ConnectionUserName
+  - javax.jdo.option.ConnectionPassword
+  
+2. 주요 테이블 in metastore DB
+
+desc DBS;
++-----------------+---------------+------+-----+---------+-------+
+| Field           | Type          | Null | Key | Default | Extra |
++-----------------+---------------+------+-----+---------+-------+
+| DB_ID           | bigint(20)    | NO   | PRI | NULL    |       |
+| DESC            | varchar(4000) | YES  |     | NULL    |       |
+| DB_LOCATION_URI | varchar(4000) | NO   |     | NULL    |       |
+| NAME            | varchar(128)  | YES  | UNI | NULL    |       |
+| OWNER_NAME      | varchar(128)  | YES  |     | NULL    |       |
+| OWNER_TYPE      | varchar(10)   | YES  |     | NULL    |       |
++-----------------+---------------+------+-----+---------+-------+
+ 
+desc TBLS;
++--------------------+--------------+------+-----+---------+-------+
+| Field              | Type         | Null | Key | Default | Extra |
++--------------------+--------------+------+-----+---------+-------+
+| TBL_ID             | bigint(20)   | NO   | PRI | NULL    |       |
+| CREATE_TIME        | int(11)      | NO   |     | NULL    |       |
+| DB_ID              | bigint(20)   | YES  | MUL | NULL    |       |
+| LAST_ACCESS_TIME   | int(11)      | NO   |     | NULL    |       |
+| OWNER              | varchar(767) | YES  |     | NULL    |       |
+| RETENTION          | int(11)      | NO   |     | NULL    |       |
+| SD_ID              | bigint(20)   | YES  | MUL | NULL    |       |
+| TBL_NAME           | varchar(256) | YES  | MUL | NULL    |       |
+| TBL_TYPE           | varchar(128) | YES  |     | NULL    |       |
+| VIEW_EXPANDED_TEXT | mediumtext   | YES  |     | NULL    |       |
+| VIEW_ORIGINAL_TEXT | mediumtext   | YES  |     | NULL    |       |
+| IS_REWRITE_ENABLED | bit(1)       | NO   |     | NULL    |       |
++--------------------+--------------+------+-----+---------+-------+
+ 
+desc PARTITIONS;
++------------------+--------------+------+-----+---------+-------+
+| Field            | Type         | Null | Key | Default | Extra |
++------------------+--------------+------+-----+---------+-------+
+| PART_ID          | bigint(20)   | NO   | PRI | NULL    |       |
+| CREATE_TIME      | int(11)      | NO   |     | NULL    |       |
+| LAST_ACCESS_TIME | int(11)      | NO   |     | NULL    |       |
+| PART_NAME        | varchar(767) | YES  | MUL | NULL    |       |
+| SD_ID            | bigint(20)   | YES  | MUL | NULL    |       |
+| TBL_ID           | bigint(20)   | YES  | MUL | NULL    |       |
++------------------+--------------+------+-----+---------+-------+
+
+3. 유용한 SQL
+
+-- Q1. ut20 database 아래의 table 들에 대한 파티션 정보 조회
+
+SELECT d.NAME as DB_NAME, t.TBL_NAME, t.TBL_TYPE, p.PART_ID, p.PART_NAME
+FROM TBLS t
+JOIN DBS d ON (t.DB_ID = d.DB_ID)
+LEFT OUTER JOIN PARTITIONS p ON (t.TBL_ID=p.TBL_ID)
+WHERE d.NAME = 'ut20'
+LIMIT 100
+;
+ 
++---------+---------------------------+----------------+---------+-------------+
+| DB_NAME | TBL_NAME                  | TBL_TYPE       | PART_ID | PART_NAME   |
++---------+---------------------------+----------------+---------+-------------+
+| ut20    | mytable1                  | MANAGED_TABLE  |   NULL  | NULL        |
+| ut20    | my_partitioned_table1     | MANAGED_TABLE  | 2667946 | dt=20171212 |
+| ut20    | my_partitioned_table1     | MANAGED_TABLE  | 2693906 | dt=20171218 |
+...
+
+-- Q2. ut20 database 아래의 table 들의 파티션 수
+
+SELECT max(d.NAME) as DB_NAME, t.TBL_ID, max(t.TBL_NAME) as TBL_NAME, COUNT(p.PART_ID) as numPartitions
+FROM TBLS t
+JOIN DBS d ON (t.DB_ID = d.DB_ID)
+LEFT OUTER JOIN PARTITIONS p ON (t.TBL_ID=p.TBL_ID)
+WHERE d.NAME = 'ut20'
+GROUP BY t.TBL_ID
+;
++---------+--------+------------------------------+---------------+
+| DB_NAME | TBL_ID | TBL_NAME                     | numPartitions |
++---------+--------+------------------------------+---------------+
+| ut20    | 150677 | mytable1                     |           0   |
+| ut20    | 150716 | my_partitioned_table1        |           365 |
+...
+
+-- Q3. 파티션이 1000 개 이상인 테이블 조회. Life cycle 관리가 안 되어 있을 가능성이 많음.
+
+SELECT max(d.NAME) as DB_NAME, t.TBL_ID, max(t.TBL_NAME) as TBL_NAME
+, COUNT(p.PART_ID) as cntPartitions, min(p.PART_NAME) as minPartName, max(p.PART_NAME) as maxPartName
+FROM TBLS t
+JOIN DBS d ON (t.DB_ID = d.DB_ID)
+LEFT OUTER JOIN PARTITIONS p ON (t.TBL_ID=p.TBL_ID)
+GROUP BY t.TBL_ID 
+HAVING numPartitions >= 1000
+ORDER BY DB_NAME, numPartitions DESC
+;
+
++------------+--------+-------------------+---------------+------------------------------+-----------------------------+
+| DB_NAME   | TBL_ID | TBL_NAME           | numPartitions | minPartName                  | maxPartName                 |
++-----------+--------+--------------------+---------------+------------------------------+-----------------------------+
+| mydb      | 337702 | mytable            |          9395 | logtype=foo/hour=2021030922 | logtype=xyz/hour=2022051310  |
+...
+
+cf. HDFS 의 table/partition 디렉토리를 세서 파악하기
+
+# Hive warehouse 1 depth partition
+hdfs dfs -du -s /user/hive/warehouse/*.db/*/*=20[12]*/ | cut -d'/' -f5,6 | sort | uniq -c
+ 
+#  Hive wareshouse 2 depth partition
+hdfs dfs -du -s /user/hive/warehouse/mydb.db/[A-Za-z]*/*=20[12]*/*=*/ | cut -d'/' -f5,6 | sort | uniq -c
+ 
+
+4. 파티션이 매우 많은 테이블 삭제시 주의점
+
+* metastore DB 의 transaction timeout 또는 lock 으로 실패할 수 있으니, 조금씩 drop partition 하는 방식으로 진행하는 것이 좋다.  
+* ex. DROP TABLE mybigtable  (파티션 수 약 17만개) 실행시
+* Hive 는 트랜잭션을 열어 metastore DB 의 관련 테이블 (PARTITIONS, SDS, CDS 등)을 업데이트하는 작업을 수행한다.
+* 이 작업의 일부는 UPDATE PARTITIONS WHERE PART_ID=12345 처럼 각 파티션 별로 반복 수행되며, 이로 인해 일부 테이블에 Lock 이 걸린다. 
+* 지정된 timeout 시간내에 트랜잭션이 완료되지 못할 경우 DROP TABLE 쿼리는 실패하며, metastore DB에서는 rollback 트랜잭션이 일어난다.
+* 이 과정에서 테이블 또는 파티션을 생성하는 유형의 Hive Query 가 metastore DB의 lock wait 로 대기하거나 실패할 수 있다.
+* 좁은 범위의 파티션을 수동 삭제하는 방식으로 처리할 수 있다.
+  - eg. ALTER TABLE mybigtable DROP PARTITION (hour < 2018010100);
+  - eg. ALTER TABLE mybigtable2 DROP PARTITION (logtype='click', hour < 2018010100);
+  - 주의. https://118k.tistory.com/780
+* metastore 에서 일괄 삭제하는 방법 
+  - https://gist.github.com/robcowie/e5772a02d519f2295dbbeb0184503642
+  - cf. 아래 hive 티켓에서 direct SQL 로 파티션을 삭제하는 방법 개발 중.(fixed version: Hive-4.0)
+  - https://issues.apache.org/jira/browse/HIVE-6980
+
+----------------------------------------------------------------------------------------
+# DELETE A TABLE IN THE HIVE METASTORE# BE CAREFUL! BACKUP THE DB BEFORE PROCEEDING!
+ 
+set @table_name = '';
+ 
+SELECT @tbl_id := TBl_ID FROM TBLS WHERE TBL_NAME = @table_name;
+ 
+-- Delete partition key vals
+DELETE pvk
+FROM PARTITION_KEY_VALS pvk
+JOIN PARTITIONS p
+ON p.PART_ID=pvk.PART_ID
+WHERE p.TBL_ID = @tbl_id;
+ 
+-- Delete partition params
+DELETE pp
+FROM PARTITION_PARAMS pp
+JOIN PARTITIONS p
+ON p.PART_ID=pp.PART_ID
+WHERE p.TBL_ID = @tbl_id;
+ 
+-- Delete partition col stats
+DELETE pcs
+FROM PART_COL_STATS pcs
+JOIN PARTITIONS p
+ON p.PART_ID=pcs.PART_ID
+WHERE p.TBL_ID = @tbl_id;
+ 
+-- Delete partition keys
+DELETE FROM PARTITION_KEYS WHERE TBL_ID = @tbl_id;
+ 
+-- Delete bucketing cols
+DELETE bc
+FROM BUCKETING_COLS bc
+JOIN PARTITIONS p
+ON bc.SD_ID=p.SD_ID
+WHERE p.TBL_ID = @tbl_id;
+ 
+-- Delete serde params
+DELETE SERDE_PARAMS
+FROM SERDE_PARAMS
+JOIN SDS ON SERDE_PARAMS.SERDE_ID=SDS.SERDE_ID
+JOIN PARTITIONS p
+ON SDS.SD_ID=p.SD_ID
+WHERE p.TBL_ID = @tbl_id;
+ 
+-- Delete skewed info when table has "SKEWED BY"
+DELETE SKEWED_COL_NAMES
+FROM SKEWED_COL_NAMES
+JOIN SDS ON SKEWED_COL_NAMES.SD_ID = SDS.SD_ID
+JOIN PARTITIONS p
+ON SDS.SD_ID=p.SD_ID
+WHERE p.TBL_ID = @tbl_id
+;
+ 
+-- Delete skewed info when table has "SKEWED BY"
+DELETE SKEWED_VALUES
+FROM SKEWED_VALUES
+JOIN SDS ON SKEWED_VALUES.SD_ID_OID = SDS.SD_ID
+JOIN PARTITIONS p
+ON SDS.SD_ID=p.SD_ID
+WHERE p.TBL_ID = @tbl_id
+;
+ 
+-- Delete sds AND the partitions
+-- Dropped together because partitions reference sds, so sds can't be deleted in isolation
+DELETE SDS, p
+FROM SDS
+JOIN PARTITIONS p
+ON SDS.SD_ID=p.SD_ID
+WHERE p.TBL_ID = @tbl_id;
+ 
+ -- Delete serdes
+DELETE SERDES
+FROM SERDES
+JOIN SDS ON SERDES.SERDE_ID=SDS.SERDE_ID
+JOIN PARTITIONS p
+ON SDS.SD_ID=p.SD_ID
+WHERE p.TBL_ID = @tbl_id;
+  
+-- And the table
+DELETE FROM TBL_COL_PRIVS where TBL_ID=@tbl_id;
+DELETE FROM TABLE_PARAMS where TBL_ID = @tbl_id;
+DELETE FROM TBL_PRIVS where TBL_ID = @tbl_id;
+DELETE FROM TBLS WHERE TBL_ID = @tbl_id;
+----------------------------------------------------------------------------------------
+
+5. 참고
+* http://www.openkb.info/2015/04/how-to-list-table-or-partition-location.html
