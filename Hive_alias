@@ -1,0 +1,48 @@
+# Hive - using alias in GROUP BY, ORDER BY, HAVING clause
+
+column alias 와 position alias(ordinal) 의 사용시 유의할 점을 설명한다.
+참고. Hive 에서는  set hive.groupby.orderby.position.alias=true; 로 position alias 사용 여부를 지정할 수 있다. 
+ 
+아래의 SQL은  GROUP BY > HAVING > SELECT (Projection) > ORDER BY  순으로 실행된다.
+
+Standard SQL 에서는  column alias 를 ORDER BY 구문에만 사용할 수 있다. 
+
+* GROUP BY 에서는 column alias를 사용할 수 없다. 아래 (3) 참조 
+* GROUP BY 에서는 position alias 을 사용할 수 있다. 아래 (2)
+* HAVING 에서는 column alias 와 position alias 를 사용할 수 없다. 단, 비표준으로 일부 DBMS 에서는 허용된다.  아래 (5)
+  - Hive 도 syntax로는 허용하나 Cost-based Optimization 이 안될 수 있음. 
+  - cf. https://issues.apache.org/jira/browse/HIVE-10557
+  - cf. https://github.com/apache/hive/blob/master/ql/src/java/org/apache/hadoop/hive/ql/parse/CalcitePlanner.java
+* ORDER BY 에서는 ORDER BY 단계로 전달된 projection 컬럼에 대해 정렬을 수행한다. 프로젝션되지 않은 컬럼은 ORDER BY 할 수 없다. 아래 (9)
+* ORDER BY 에서는 column alias 가 허용된다. position alias 로 참조되는 컬럼명과 column alias 가 같은 경우에는 position alias 도 허용된다. 아래 (7, 8)
+
+-----------------------------------------------------------------
+SELECT clientid
+, nvl(campaignid, 'U') as camid
+, count(*) AS ck_count
+FROM mytable
+WHERE hour = '2022010905'
+AND logtype = 'ck'
+GROUP BY clientid, nvl(campaignid, 'U') -- (1) OK
+-- GROUP BY 1, 2                        -- (2) OK
+-- GROUP BY clientid, camid             -- (3) ERROR
+HAVING count(*) > 10                    -- (4) OK 
+-- HAVING ck_count > 10                 -- (5) 비표준. 권장 안함.
+ORDER BY camid                          -- (6) OK
+-- ORDER BY 1                           -- (7) OK
+-- ORDER BY 2                           -- (8) ERROR 
+-- ORDER BY campaignid                  -- (9) ERROR
+;
+-----------------------------------------------------------------
+
+-- (1) OK. 좀 번잡해보이지만 성능상 문제는 없음. nvl 펑션은 한번만 GROUP BY 단계에서 실행됨
+-- (2) OK. GROUP BY position alias 는 허용됨
+-- (3) ERROR : GROUP BY column alias 는 허용되지 않음
+-- (4) OK. 좀 번잡해보이지만 성능상 문제는 없음. count 펑션은 한번만 GROUP BY 단계에서 수행됨.
+-- (5) 비표준. 일부 DBMS에서 허용. Hive는 조건부 허용. 그러나 권장하지 않음.
+-- (6) OK. ORDER BY column alias 는 허용됨
+-- (7) OK. position alias 로 참조되는 컬럼명과 column alias가 동일한 경우 position alias 사용 가능.
+-- (8) ERROR. position alias 로 참조되는 컬럼명과 column alias가 동일하지 않은 경우 position alias 사용 불가.
+-- (9) ERROR. ORDER BY 단계에서는 campaignid 컬럼이 전달되지 않았음. 프로젝션되지 않은 campaignid 컬럼으로는 정렬 불가.
+ 
+
